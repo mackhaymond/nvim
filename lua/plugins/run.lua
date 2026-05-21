@@ -9,7 +9,7 @@ end
 
 return {
     {
-        "spyicydev/run.nvim",
+        "mackhaymond/run.nvim",
         event = "VeryLazy",
         keys = {
             { "<leader>rr", "<cmd>Run<cr>",     desc = "Run" },
