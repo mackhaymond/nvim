@@ -3,6 +3,7 @@ vim.loader.enable()
 -- import keymaps and general settings
 require('keymaps')
 require('set')
+require('chezmoi_workflow')
 
 -- disable unused language providers (saves ~10-50ms each at startup)
 vim.g.loaded_perl_provider = 0

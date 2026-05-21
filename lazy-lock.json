@@ -7,6 +7,7 @@
   "blink.cmp": { "branch": "main", "commit": "78336bc89ee5365633bcf754d93df01678b5c08f" },
   "blink.compat": { "branch": "main", "commit": "2ed6d9a28b07fa6f3bface818470605f8896408c" },
   "catppuccin": { "branch": "main", "commit": "426dbebe06b5c69fd846ceb17b42e12f890aedf1" },
+  "chezmoi.vim": { "branch": "main", "commit": "73b30df35c6b645ebd2e6a440eea8463ef3c3f47" },
   "cmake-tools.nvim": { "branch": "master", "commit": "f9a3eb2be0b8148df470244e5c25aede3a3a28a5" },
   "cmp-conjure": { "branch": "master", "commit": "8c9a88efedc0e5bf3165baa6af8a407afe29daf6" },
   "codesnap.nvim": { "branch": "main", "commit": "0a0941340376439a25d6cd8a4d1d2b372edbfdbd" },
