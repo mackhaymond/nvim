@@ -16,6 +16,10 @@ return {
             { "<leader>rt", "<cmd>RunProj<cr>", desc = "Run project command" },
         },
         opts = {
+            terminal = {
+                backend = "fterm",
+                position = "float",
+            },
             filetype = {
                 scala = function()
                     vim.notify("Execute 'sbt run' in a separate tmux window!")
