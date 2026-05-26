@@ -11,7 +11,7 @@ return {
                 -- A list of parser names, or "all" (the five listed parsers should always be installed)
                 ensure_installed = {
                     "javascript", "typescript", "rust", "c", "lua", "vim", "vimdoc", "query",
-                    "python", "json", "yaml", "toml", "markdown", "markdown_inline",
+                    "python", "json", "yaml", "toml", "typst", "markdown", "markdown_inline",
                     "bash", "html", "css", "regex",
                 },
 
