@@ -49,8 +49,14 @@ local function glow_preview()
     vim.cmd("startinsert")
 end
 
-vim.keymap.set("n", "<leader>mp", glow_preview, {
-    desc = "Preview markdown in glow (fullscreen)",
+vim.api.nvim_create_autocmd("FileType", {
+    pattern = "markdown",
+    callback = function(event)
+        vim.keymap.set("n", "<leader>mp", glow_preview, {
+            buffer = event.buf,
+            desc = "Preview markdown in glow (fullscreen)",
+        })
+    end,
 })
 
 return {
