@@ -6,6 +6,32 @@ return {
         event = { "BufReadPost", "BufNewFile" },
 
         config = function()
+            -- nvim-treesitter's frozen master branch still provides the old
+            -- `set-lang-from-info-string!` directive used by markdown
+            -- injections. On newer Neovim nightlies the directive can receive
+            -- a non-node capture and crash inside `vim.treesitter.get_node_text`
+            -- while drawing markdown buffers. Keep markdown usable by making
+            -- the directive defensive until this config can move to
+            -- nvim-treesitter's rewritten main branch.
+            local ts_query = require("vim.treesitter.query")
+            ts_query.add_directive("set-lang-from-info-string!", function(match, _, bufnr, pred, metadata)
+                local node = match[pred[2]]
+                if not node or type(node.range) ~= "function" then
+                    return
+                end
+
+                local ok, text = pcall(vim.treesitter.get_node_text, node, bufnr)
+                if not ok or not text then
+                    return
+                end
+
+                local injection_alias = text:lower()
+                local lang = vim.filetype.match({ filename = "a." .. injection_alias })
+                    or ({ ex = "elixir", pl = "perl", sh = "bash", uxn = "uxntal", ts = "typescript" })[injection_alias]
+                    or injection_alias
+                metadata["injection.language"] = lang
+            end, { force = true, all = false })
+
             ---@diagnostic disable: missing-fields
             require 'nvim-treesitter.configs'.setup({
                 -- A list of parser names, or "all" (the five listed parsers should always be installed)
