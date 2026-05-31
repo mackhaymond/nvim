@@ -4,6 +4,7 @@
 -- Three responsibilities:
 --   1. Intercept: opening a managed live path (e.g. ~/.zshrc) swaps the
 --      buffer to its chezmoi source (e.g. .../dot_zshrc.tmpl).
+--      Encrypted sources open as in-memory decrypted buffers.
 --   2. Auto-apply: saving a source file runs `chezmoi apply <target>`.
 --   3. Notify: every chezmoi-relevant action is announced via vim.notify.
 --
@@ -24,6 +25,8 @@ local M = {}
 local source_dir = vim.fn.expand("~/.local/share/chezmoi")
 local managed = {}         -- set of absolute live paths managed by chezmoi
 local notified_source = {} -- bufnr → true; one "editing source" notify per buf
+local encrypted_buffers = {} -- bufnr → decrypted edit session metadata
+local encrypted_source_buffers = {} -- source path → decrypted bufnr
 
 -- Startup-time notify queue.
 --
@@ -92,6 +95,274 @@ local function load_managed()
     return vim.tbl_count(managed)
 end
 
+local function is_encrypted_source(path)
+    return path:match("%.age$") ~= nil
+end
+
+local function protect_secret_buffer(buf)
+    vim.bo[buf].swapfile = false
+    vim.bo[buf].undofile = false
+    vim.bo[buf].fixendofline = false
+end
+
+local function cleanup_encrypted_buffer(buf)
+    local info = encrypted_buffers[buf]
+    if info then
+        encrypted_source_buffers[info.source] = nil
+    end
+    encrypted_buffers[buf] = nil
+end
+
+local function apply_target(target)
+    local stderr_buf = {}
+    vim.fn.jobstart({ "chezmoi", "apply", target }, {
+        stderr_buffered = true,
+        on_stderr = function(_, data) stderr_buf = data or {} end,
+        on_exit = function(_, code)
+            local target_short = vim.fn.fnamemodify(target, ":~")
+            if code == 0 then
+                notify("chezmoi: applied " .. target_short, vim.log.levels.INFO)
+            else
+                local err = table.concat(stderr_buf, "\n"):sub(-200)
+                notify(string.format("chezmoi: apply failed for %s\n%s",
+                        target_short, err),
+                    vim.log.levels.ERROR)
+            end
+        end,
+    })
+end
+
+local function apply_target_sync(target)
+    local output = vim.fn.system({ "chezmoi", "apply", target })
+    local target_short = vim.fn.fnamemodify(target, ":~")
+    if vim.v.shell_error == 0 then
+        notify("chezmoi: applied " .. target_short, vim.log.levels.INFO)
+        return true
+    end
+
+    return false, vim.fn.trim(output):sub(-200)
+end
+
+local function target_for_source(source)
+    local target = vim.fn.trim(vim.fn.system({ "chezmoi", "target-path", source }))
+    if vim.v.shell_error ~= 0 or target == "" then return nil end
+    return target
+end
+
+local function decrypted_buffer_name(source, target)
+    local path = target or source:gsub("%.age$", "")
+    return "chezmoi-decrypted://" .. path
+end
+
+local write_encrypted_buffer
+
+local function configure_decrypted_buffer(buf, source, target)
+    encrypted_buffers[buf] = {
+        source = source,
+        target = target,
+    }
+    encrypted_source_buffers[source] = buf
+
+    vim.bo[buf].buftype = "acwrite"
+    protect_secret_buffer(buf)
+    vim.b[buf].chezmoi_decrypted_source = source
+    vim.b[buf].chezmoi_decrypted_target = target or ""
+
+    local write_cmd = vim.b[buf].chezmoi_decrypted_write_cmd
+    local has_write_cmd = false
+    if write_cmd then
+        local ok, autocmds = pcall(vim.api.nvim_get_autocmds, { id = write_cmd })
+        has_write_cmd = ok and #autocmds > 0
+    end
+
+    if not has_write_cmd then
+        vim.b[buf].chezmoi_decrypted_write_cmd = vim.api.nvim_create_autocmd("BufWriteCmd", {
+            buffer = buf,
+            callback = function(args)
+                write_encrypted_buffer(args.buf)
+            end,
+        })
+    end
+end
+
+local function find_decrypted_buffer(source, target)
+    local existing_buf = encrypted_source_buffers[source]
+    if existing_buf
+        and vim.api.nvim_buf_is_valid(existing_buf)
+        and vim.api.nvim_buf_is_loaded(existing_buf)
+    then
+        configure_decrypted_buffer(existing_buf, source, target)
+        return existing_buf
+    end
+    encrypted_source_buffers[source] = nil
+
+    local name = decrypted_buffer_name(source, target)
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(buf)
+            and vim.api.nvim_buf_get_name(buf) == name
+        then
+            if vim.api.nvim_buf_is_loaded(buf) then
+                if encrypted_buffers[buf]
+                    or vim.b[buf].chezmoi_decrypted_source == source
+                then
+                    configure_decrypted_buffer(buf, source, target)
+                    return buf
+                end
+
+                if vim.bo[buf].modified then
+                    notify(string.format(
+                            "chezmoi: decrypted buffer name already in use: %s",
+                            name),
+                        vim.log.levels.ERROR)
+                    return nil
+                end
+
+                vim.api.nvim_buf_delete(buf, { force = true })
+                return nil
+            end
+
+            -- An unloaded synthetic buffer can still reserve the unique name.
+            -- Drop it so a fresh in-memory decrypted buffer can be created.
+            vim.api.nvim_buf_delete(buf, { force = true })
+        end
+    end
+end
+
+local function split_buffer_lines(text)
+    if text == "" then return { "" } end
+
+    local lines = vim.split(text, "\n", { plain = true })
+    if text:sub(-1) == "\n" then
+        table.remove(lines)
+    end
+    if #lines == 0 then return { "" } end
+    return lines
+end
+
+local function encrypted_buffer_text(buf)
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    if #lines == 1 and lines[1] == "" and not vim.bo[buf].endofline then
+        return ""
+    end
+
+    local text = table.concat(lines, "\n")
+    if vim.bo[buf].endofline then text = text .. "\n" end
+    return text
+end
+
+local function encrypted_write_error(buf, msg)
+    vim.bo[buf].modified = true
+    notify(msg, vim.log.levels.ERROR)
+    error(msg, 0)
+end
+
+write_encrypted_buffer = function(buf)
+    local info = encrypted_buffers[buf]
+    if not info then return end
+
+    local output = vim.fn.system({
+        "chezmoi", "encrypt",
+        "--output", info.source,
+    }, encrypted_buffer_text(buf))
+    if vim.v.shell_error ~= 0 then
+        encrypted_write_error(buf, string.format(
+            "chezmoi: encrypt failed for %s\n%s",
+                vim.fn.fnamemodify(info.source, ":~"),
+                vim.fn.trim(output):sub(-200)))
+    end
+
+    if info.target then
+        local ok, apply_err = apply_target_sync(info.target)
+        if ok then
+            vim.bo[buf].modified = false
+        else
+            encrypted_write_error(buf, string.format(
+                "chezmoi: apply failed for %s\n%s",
+                vim.fn.fnamemodify(info.target, ":~"),
+                apply_err or ""))
+        end
+    else
+        vim.bo[buf].modified = false
+        notify(string.format("chezmoi: encrypted %s, but no target resolved",
+                vim.fn.fnamemodify(info.source, ":~")),
+            vim.log.levels.WARN)
+    end
+end
+
+local function open_decrypted_source(source, target, old_buf, from_short)
+    target = target or target_for_source(source)
+
+    local existing_buf = find_decrypted_buffer(source, target)
+    if existing_buf then
+        vim.api.nvim_set_current_buf(existing_buf)
+        if old_buf and vim.api.nvim_buf_is_valid(old_buf) and old_buf ~= existing_buf then
+            vim.cmd("bwipeout! " .. old_buf)
+        end
+
+        local label = target or source
+        if from_short then
+            notify(string.format("chezmoi: intercepted %s -> editing decrypted %s",
+                    from_short, vim.fn.fnamemodify(label, ":~")),
+                vim.log.levels.INFO)
+        else
+            notify(string.format("chezmoi: editing decrypted %s",
+                    vim.fn.fnamemodify(label, ":~")),
+                vim.log.levels.INFO)
+        end
+        return
+    end
+
+    local output = vim.fn.system({
+        "chezmoi", "decrypt",
+        source,
+    })
+    if vim.v.shell_error ~= 0 then
+        notify(string.format("chezmoi: decrypt failed for %s\n%s",
+                vim.fn.fnamemodify(source, ":~"),
+                vim.fn.trim(output):sub(-200)),
+            vim.log.levels.ERROR)
+        return
+    end
+
+    local buf = vim.api.nvim_create_buf(true, false)
+    -- Keep decrypted secrets in memory, not in persistent editor side files.
+    configure_decrypted_buffer(buf, source, target)
+
+    local ok, err = pcall(vim.api.nvim_buf_set_name, buf,
+        decrypted_buffer_name(source, target))
+    if not ok then
+        vim.api.nvim_buf_delete(buf, { force = true })
+        notify(string.format("chezmoi: failed to name decrypted buffer\n%s", err),
+            vim.log.levels.ERROR)
+        return
+    end
+
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, split_buffer_lines(output))
+    vim.api.nvim_set_current_buf(buf)
+
+    vim.bo[buf].endofline = output:sub(-1) == "\n"
+    if target and vim.filetype and vim.filetype.match then
+        local ft = vim.filetype.match({ filename = target })
+        if ft then vim.bo[buf].filetype = ft end
+    end
+    vim.bo[buf].modified = false
+
+    if old_buf and vim.api.nvim_buf_is_valid(old_buf) and old_buf ~= buf then
+        vim.cmd("bwipeout! " .. old_buf)
+    end
+
+    local label = target or source
+    if from_short then
+        notify(string.format("chezmoi: intercepted %s -> editing decrypted %s",
+                from_short, vim.fn.fnamemodify(label, ":~")),
+            vim.log.levels.INFO)
+    else
+        notify(string.format("chezmoi: editing decrypted %s",
+                vim.fn.fnamemodify(label, ":~")),
+            vim.log.levels.INFO)
+    end
+end
+
 load_managed()
 
 vim.api.nvim_create_user_command("ChezmoiRehook", function()
@@ -107,6 +378,22 @@ vim.api.nvim_create_user_command("ChezmoiNotifyTest", function()
 end, { desc = "Fire one notify at each level (diagnostic)" })
 
 -- INTERCEPT
+vim.api.nvim_create_autocmd("BufReadPre", {
+    pattern = "*",
+    callback = function(args)
+        local path = vim.fn.fnamemodify(args.match, ":p")
+        if path:sub(1, #source_dir) == source_dir then return end
+        if not managed[path] then return end
+
+        local source = vim.fn.trim(vim.fn.system({ "chezmoi", "source-path", path }))
+        if vim.v.shell_error ~= 0 or source == "" then return end
+        if not is_encrypted_source(source) then return end
+
+        protect_secret_buffer(args.buf)
+        vim.b[args.buf].chezmoi_encrypted_live_source = source
+    end,
+})
+
 vim.api.nvim_create_autocmd("BufReadPost", {
     pattern = "*",
     callback = function(args)
@@ -119,6 +406,18 @@ vim.api.nvim_create_autocmd("BufReadPost", {
         if path:sub(1, #source_dir) == source_dir then
             if intercepting then
                 notified_source[args.buf] = true
+                return
+            end
+            if is_encrypted_source(path) then
+                if vim.bo[args.buf].readonly then
+                    notify(string.format(
+                        "chezmoi: -R / readonly - viewing encrypted source %s",
+                        vim.fn.fnamemodify(path, ":~")), vim.log.levels.WARN)
+                    return
+                end
+                vim.schedule(function()
+                    open_decrypted_source(path, nil, args.buf, nil)
+                end)
                 return
             end
             if not notified_source[args.buf] then
@@ -152,6 +451,14 @@ vim.api.nvim_create_autocmd("BufReadPost", {
         local source_short = vim.fn.fnamemodify(source, ":~")
 
         vim.schedule(function()
+            if is_encrypted_source(source) then
+                if vim.api.nvim_buf_is_valid(live_buf) then
+                    protect_secret_buffer(live_buf)
+                end
+                open_decrypted_source(source, path, live_buf, live_short)
+                return
+            end
+
             intercepting = true
             vim.cmd("edit " .. vim.fn.fnameescape(source))
             intercepting = false
@@ -168,7 +475,19 @@ vim.api.nvim_create_autocmd("BufReadPost", {
 -- Cleanup notified-source marker when the source buffer is wiped.
 vim.api.nvim_create_autocmd("BufWipeout", {
     pattern = "*",
-    callback = function(args) notified_source[args.buf] = nil end,
+    callback = function(args)
+        notified_source[args.buf] = nil
+        cleanup_encrypted_buffer(args.buf)
+    end,
+})
+
+vim.api.nvim_create_autocmd("VimLeavePre", {
+    pattern = "*",
+    callback = function()
+        for buf, _ in pairs(encrypted_buffers) do
+            cleanup_encrypted_buffer(buf)
+        end
+    end,
 })
 
 -- AUTO-APPLY
@@ -176,30 +495,15 @@ vim.api.nvim_create_autocmd("BufWritePost", {
     pattern = source_dir .. "/*",
     callback = function(args)
         local source = vim.fn.fnamemodify(args.match, ":p")
-        local target = vim.fn.trim(vim.fn.system({ "chezmoi", "target-path", source }))
-        if vim.v.shell_error ~= 0 or target == "" then
+        local target = target_for_source(source)
+        if not target then
             notify(string.format("chezmoi: no target resolved for %s",
                     vim.fs.basename(source)),
                 vim.log.levels.WARN)
             return
         end
 
-        local stderr_buf = {}
-        vim.fn.jobstart({ "chezmoi", "apply", target }, {
-            stderr_buffered = true,
-            on_stderr = function(_, data) stderr_buf = data or {} end,
-            on_exit = function(_, code)
-                local target_short = vim.fn.fnamemodify(target, ":~")
-                if code == 0 then
-                    notify("chezmoi: applied " .. target_short, vim.log.levels.INFO)
-                else
-                    local err = table.concat(stderr_buf, "\n"):sub(-200)
-                    notify(string.format("chezmoi: apply failed for %s\n%s",
-                            target_short, err),
-                        vim.log.levels.ERROR)
-                end
-            end,
-        })
+        apply_target(target)
     end,
 })
 
