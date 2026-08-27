@@ -5,13 +5,27 @@
 --   1. Intercept: opening a managed live path (e.g. ~/.zshrc) swaps the
 --      buffer to its chezmoi source (e.g. .../dot_zshrc.tmpl).
 --      Encrypted sources open as in-memory decrypted buffers.
---   2. Auto-apply: saving a source file runs `chezmoi apply <target>`.
+--   2. Auto-apply: saving a source file runs `chezmoi apply <target>` —
+--      only for sources that map to a currently managed target. Repo
+--      metadata (.git/**), chezmoi's own dotfiles (.chezmoiignore,
+--      .chezmoiexternal.toml, .chezmoitemplates/, .chezmoiscripts/) and
+--      .chezmoiignore'd docs (README.md, OPERATIONS.md, ...) are skipped
+--      silently. Scripts are deliberately excluded: applying a run_*
+--      script from an editor save would execute it as a side effect.
 --   3. Notify: every chezmoi-relevant action is announced via vim.notify.
 --
 -- Bypasses for the intercept:
 --   - Buffer is readonly (`nvim -R`, `:setl ro`) → show rendered file.
 --   - Path is already inside the chezmoi source dir → no swap needed.
+--   - Path is outside $HOME (chezmoi's destination dir) → can't be managed.
 --   - Path is unmanaged → silent fall-through.
+--
+-- Cost model: `chezmoi managed` (~18ms) is started asynchronously at
+-- require time and only waited on by the first BufReadPre for a path that
+-- could be managed (under $HOME, outside the source dir). `nvim` with no
+-- file, or with a file outside $HOME, never blocks on it. The
+-- `chezmoi source-path` lookup is done once per open (BufReadPre) and
+-- handed to BufReadPost via b:chezmoi_source.
 --
 -- Manual escape if this file breaks:
 --   nvim --clean $(chezmoi source-path ~/.zshrc)
@@ -23,7 +37,10 @@
 local M = {}
 
 local source_dir = vim.fn.expand("~/.local/share/chezmoi")
+local home_dir = vim.uv.os_homedir()   -- chezmoi's destination dir
 local managed = {}         -- set of absolute live paths managed by chezmoi
+local managed_loaded = false -- true once `managed` reflects a completed load
+local managed_job = nil    -- in-flight vim.system handle for `chezmoi managed`
 local notified_source = {} -- bufnr → true; one "editing source" notify per buf
 local encrypted_buffers = {} -- bufnr → decrypted edit session metadata
 local encrypted_source_buffers = {} -- source path → decrypted bufnr
@@ -82,17 +99,68 @@ vim.defer_fn(flush_queue, 2000)
 -- "intercepted" notify. Set before the recursive :edit, cleared after.
 local intercepting = false
 
-local function load_managed()
+local MANAGED_CMD = {
+    "chezmoi", "managed",
+    "--path-style=absolute",
+    "--include=files,symlinks",
+}
+
+local function set_managed(lines)
     managed = {}
-    local lines = vim.fn.systemlist({
-        "chezmoi", "managed",
-        "--path-style=absolute",
-        "--include=files,symlinks",
-    })
-    if vim.v.shell_error == 0 then
-        for _, p in ipairs(lines) do managed[p] = true end
+    for _, p in ipairs(lines) do
+        if p ~= "" then managed[p] = true end
     end
+    managed_loaded = true
     return vim.tbl_count(managed)
+end
+
+-- Synchronous (re)load. Used by :ChezmoiRehook, by the auto-apply
+-- managed-target check, and as the fallback when no async job is pending.
+local function load_managed()
+    managed_job = nil
+    local lines = vim.fn.systemlist(MANAGED_CMD)
+    if vim.v.shell_error ~= 0 then lines = {} end
+    return set_managed(lines)
+end
+
+-- Kick off `chezmoi managed` without blocking. ensure_managed() collects it.
+local function load_managed_async()
+    if managed_loaded or managed_job then return end
+    local ok, job = pcall(vim.system, MANAGED_CMD, { text = true })
+    if ok then managed_job = job end
+end
+
+-- Block until `managed` is populated: join the in-flight job if there is
+-- one (usually already finished by the time the first file is read),
+-- otherwise run it synchronously. A failed load still marks the set as
+-- loaded (empty) so a broken chezmoi doesn't cost 18ms per buffer.
+local function ensure_managed()
+    if managed_loaded then return end
+    if managed_job then
+        local res = managed_job:wait(5000)
+        managed_job = nil
+        if res.code == 0 then
+            set_managed(vim.split(res.stdout or "", "\n", { plain = true }))
+        else
+            set_managed({})
+        end
+        return
+    end
+    load_managed()
+end
+
+-- Cheap pre-filter: chezmoi only manages paths under its destination dir
+-- ($HOME), and paths inside the source dir are never intercepted.
+local function could_be_managed(path)
+    if path:sub(1, #source_dir) == source_dir then return false end
+    return path:sub(1, #home_dir + 1) == home_dir .. "/"
+end
+
+-- One `chezmoi source-path` spawn; nil when the path has no source.
+local function source_for_target(path)
+    local source = vim.fn.trim(vim.fn.system({ "chezmoi", "source-path", path }))
+    if vim.v.shell_error ~= 0 or source == "" then return nil end
+    return source
 end
 
 local function is_encrypted_source(path)
@@ -363,7 +431,7 @@ local function open_decrypted_source(source, target, old_buf, from_short)
     end
 end
 
-load_managed()
+load_managed_async()
 
 vim.api.nvim_create_user_command("ChezmoiRehook", function()
     local n = load_managed()
@@ -382,15 +450,18 @@ vim.api.nvim_create_autocmd("BufReadPre", {
     pattern = "*",
     callback = function(args)
         local path = vim.fn.fnamemodify(args.match, ":p")
-        if path:sub(1, #source_dir) == source_dir then return end
+        if not could_be_managed(path) then return end
+        ensure_managed()
         if not managed[path] then return end
 
-        local source = vim.fn.trim(vim.fn.system({ "chezmoi", "source-path", path }))
-        if vim.v.shell_error ~= 0 or source == "" then return end
+        local source = source_for_target(path)
+        if not source then return end
+        -- Resolved once here; BufReadPost reads it back instead of
+        -- spawning `chezmoi source-path` a second time.
+        vim.b[args.buf].chezmoi_source = source
         if not is_encrypted_source(source) then return end
 
         protect_secret_buffer(args.buf)
-        vim.b[args.buf].chezmoi_encrypted_live_source = source
     end,
 })
 
@@ -428,6 +499,8 @@ vim.api.nvim_create_autocmd("BufReadPost", {
             return
         end
 
+        if not could_be_managed(path) then return end -- outside $HOME: silent
+        ensure_managed()
         if not managed[path] then return end -- unmanaged: silent
 
         -- Readonly bypass: user explicitly wants the rendered output.
@@ -438,8 +511,8 @@ vim.api.nvim_create_autocmd("BufReadPost", {
             return
         end
 
-        local source = vim.fn.trim(vim.fn.system({ "chezmoi", "source-path", path }))
-        if vim.v.shell_error ~= 0 or source == "" then
+        local source = vim.b[args.buf].chezmoi_source or source_for_target(path)
+        if not source then
             notify(string.format(
                 "chezmoi: source-path failed for %s, not intercepting",
                 vim.fn.fnamemodify(path, ":~")), vim.log.levels.WARN)
@@ -495,12 +568,31 @@ vim.api.nvim_create_autocmd("BufWritePost", {
     pattern = source_dir .. "/*",
     callback = function(args)
         local source = vim.fn.fnamemodify(args.match, ":p")
+
+        -- `*` crosses `/`, so this fires for everything under the source
+        -- dir. Repo metadata and chezmoi's own .chezmoi* files/dirs
+        -- (ignore, external, templates, scripts) never map to a managed
+        -- target: skip them before spawning anything.
+        local rel = source:sub(#source_dir + 2)
+        if rel:match("^%.git/") or rel:match("^%.chezmoi") then return end
+
         local target = target_for_source(source)
         if not target then
             notify(string.format("chezmoi: no target resolved for %s",
                     vim.fs.basename(source)),
                 vim.log.levels.WARN)
             return
+        end
+
+        -- `chezmoi target-path` is a pure name transform (README.md →
+        -- ~/README.md, exit 0), so validate against the managed set.
+        -- A miss may just be a source file added since the cache was
+        -- built, so refresh once before giving up; a persistent miss is
+        -- a .chezmoiignore'd file (README.md, OPERATIONS.md, ...) → silent.
+        ensure_managed()
+        if not managed[target] then
+            load_managed()
+            if not managed[target] then return end
         end
 
         apply_target(target)
