@@ -40,6 +40,7 @@ local source_dir = vim.fn.expand("~/.local/share/chezmoi")
 local home_dir = vim.uv.os_homedir()   -- chezmoi's destination dir
 local managed = {}         -- set of absolute live paths managed by chezmoi
 local managed_loaded = false -- true once `managed` reflects a completed load
+local managed_ok = false     -- true when that load exited 0 (set is trustworthy)
 local managed_job = nil    -- in-flight vim.system handle for `chezmoi managed`
 local notified_source = {} -- bufnr → true; one "editing source" notify per buf
 local encrypted_buffers = {} -- bufnr → decrypted edit session metadata
@@ -105,12 +106,17 @@ local MANAGED_CMD = {
     "--include=files,symlinks",
 }
 
-local function set_managed(lines)
+-- `ok` = the load exited 0. A failed load still counts as loaded (empty)
+-- so a broken chezmoi doesn't cost 18ms per buffer, but managed_ok stays
+-- false so the auto-apply hook doesn't mistake "load failed" for
+-- "target unmanaged".
+local function set_managed(lines, ok)
     managed = {}
     for _, p in ipairs(lines) do
         if p ~= "" then managed[p] = true end
     end
     managed_loaded = true
+    managed_ok = ok
     return vim.tbl_count(managed)
 end
 
@@ -119,8 +125,9 @@ end
 local function load_managed()
     managed_job = nil
     local lines = vim.fn.systemlist(MANAGED_CMD)
-    if vim.v.shell_error ~= 0 then lines = {} end
-    return set_managed(lines)
+    local ok = vim.v.shell_error == 0
+    if not ok then lines = {} end
+    return set_managed(lines, ok)
 end
 
 -- Kick off `chezmoi managed` without blocking. ensure_managed() collects it.
@@ -140,9 +147,9 @@ local function ensure_managed()
         local res = managed_job:wait(5000)
         managed_job = nil
         if res.code == 0 then
-            set_managed(vim.split(res.stdout or "", "\n", { plain = true }))
+            set_managed(vim.split(res.stdout or "", "\n", { plain = true }), true)
         else
-            set_managed({})
+            set_managed({}, false)
         end
         return
     end
@@ -589,10 +596,19 @@ vim.api.nvim_create_autocmd("BufWritePost", {
         -- A miss may just be a source file added since the cache was
         -- built, so refresh once before giving up; a persistent miss is
         -- a .chezmoiignore'd file (README.md, OPERATIONS.md, ...) → silent.
+        -- But only trust a miss when the load itself succeeded: if
+        -- `chezmoi managed` failed (templated .chezmoiignore error, chezmoi
+        -- not on PATH, locked state DB) fall back to the unconditional
+        -- apply so the failure surfaces as a toast instead of silent drift.
         ensure_managed()
         if not managed[target] then
             load_managed()
-            if not managed[target] then return end
+            if not managed[target] then
+                if managed_ok then return end
+                notify("chezmoi: `chezmoi managed` failed — applying "
+                    .. "unconditionally; run :ChezmoiRehook once fixed",
+                    vim.log.levels.WARN)
+            end
         end
 
         apply_target(target)
