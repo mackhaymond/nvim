@@ -124,8 +124,10 @@ end
 -- managed-target check, and as the fallback when no async job is pending.
 local function load_managed()
     managed_job = nil
-    local lines = vim.fn.systemlist(MANAGED_CMD)
-    local ok = vim.v.shell_error == 0
+    -- pcall: systemlist throws E475 when chezmoi isn't installed (e.g. on a
+    -- remote box sharing this config), which would fire on every buffer read.
+    local called, lines = pcall(vim.fn.systemlist, MANAGED_CMD)
+    local ok = called and vim.v.shell_error == 0
     if not ok then lines = {} end
     return set_managed(lines, ok)
 end

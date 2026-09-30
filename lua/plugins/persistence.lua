@@ -52,7 +52,7 @@ return {
             end
 
             vim.api.nvim_create_autocmd(
-                { "BufWritePost", "BufEnter", "BufDelete", "WinEnter", "WinClose", "TabEnter", "TabClosed" },
+                { "BufWritePost", "BufEnter", "BufDelete", "WinEnter", "WinClosed", "TabEnter", "TabClosed" },
                 {
                     group = group,
                     callback = function()
