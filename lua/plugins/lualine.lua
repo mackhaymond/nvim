@@ -29,7 +29,8 @@ return {
                     lualine_a = { 'mode' },
                     lualine_b = { 'branch', 'diff', 'diagnostics' },
                     lualine_c = { 'filename' },
-                    lualine_x = {
+                    -- copilot-lualine isn't installed in lite mode (lua/lite.lua)
+                    lualine_x = vim.list_extend(vim.g.lite and {} or {
                         -- require("opencode_lualine").component,
                         {
                             'copilot',
@@ -44,10 +45,11 @@ return {
                                 }
                             }
                         },
+                    }, {
                         'encoding',
                         'fileformat',
                         'filetype'
-                    },
+                    }),
                     lualine_y = { 'progress' },
                     lualine_z = { 'location' }
                 },

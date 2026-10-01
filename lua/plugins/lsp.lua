@@ -73,10 +73,12 @@ return {
             snippets = { preset = 'luasnip' },
 
             sources = {
-                default = { 'lsp', 'path', 'snippets', 'buffer', 'lazydev', 'conjure', 'copilot' },
-                per_filetype = {
+                -- lite (lua/lite.lua) has no LSP / lazydev / conjure / copilot
+                default = vim.g.lite and { 'path', 'snippets', 'buffer' }
+                    or { 'lsp', 'path', 'snippets', 'buffer', 'lazydev', 'conjure', 'copilot' },
+                per_filetype = not vim.g.lite and {
                     lua = { inherit_defaults = true, 'lazydev' },
-                },
+                } or nil,
                 providers = {
                     lazydev = {
                         name = 'LazyDev',

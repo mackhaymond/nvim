@@ -22,7 +22,15 @@ if not vim.uv.fs_stat(lazypath) then
     })
 end
 vim.opt.rtp:prepend(lazypath)
-require("lazy").setup("plugins", {
+
+-- Lite mode on the SEAS servers (or NVIM_LITE=1; NVIM_LITE=0 forces full):
+-- only the plugins that shape editing, see lua/lite.lua. It keeps its own
+-- lockfile so the repo's lazy-lock.json isn't rewritten to the subset there.
+vim.g.lite = vim.env.NVIM_LITE == "1"
+    or (vim.env.NVIM_LITE ~= "0" and (vim.uv.os_gethostname() or ""):find("%.seas%.ucla%.edu$") ~= nil)
+
+require("lazy").setup(vim.g.lite and require("lite").spec or "plugins", {
+    lockfile = vim.g.lite and vim.fn.stdpath("data") .. "/lazy-lock-lite.json" or nil,
     dev = {
         path = "~/projects/nvim_dev",
     },
