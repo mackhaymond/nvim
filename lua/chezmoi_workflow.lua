@@ -190,9 +190,23 @@ local function cleanup_encrypted_buffer(buf)
     encrypted_buffers[buf] = nil
 end
 
+-- chezmoi's op:// templates need the 1Password service-account token, which is
+-- never exported (see ~/.zshenv): read it from the Keychain for each apply.
+-- Agent shells don't get it (same markers as ~/.zshenv).
+local function op_env()
+    for _, k in ipairs({ "AGENT_PTY", "AGENT_SHELL", "OPENCODE", "OPENCODE_TERMINAL", "CLAUDECODE" }) do
+        if vim.env[k] and vim.env[k] ~= "" then return nil end
+    end
+    local r = vim.system({ "security", "find-generic-password",
+        "-s", "op-service-account-token", "-a", vim.env.USER, "-w" }, { text = true }):wait()
+    if r.code ~= 0 then return nil end
+    return { OP_SERVICE_ACCOUNT_TOKEN = vim.trim(r.stdout or "") }
+end
+
 local function apply_target(target)
     local stderr_buf = {}
     vim.fn.jobstart({ "chezmoi", "apply", target }, {
+        env = op_env(),
         stderr_buffered = true,
         on_stderr = function(_, data) stderr_buf = data or {} end,
         on_exit = function(_, code)
@@ -210,9 +224,10 @@ local function apply_target(target)
 end
 
 local function apply_target_sync(target)
-    local output = vim.fn.system({ "chezmoi", "apply", target })
+    local r = vim.system({ "chezmoi", "apply", target }, { env = op_env(), text = true }):wait()
+    local output = (r.stdout or "") .. (r.stderr or "")
     local target_short = vim.fn.fnamemodify(target, ":~")
-    if vim.v.shell_error == 0 then
+    if r.code == 0 then
         notify("chezmoi: applied " .. target_short, vim.log.levels.INFO)
         return true
     end
